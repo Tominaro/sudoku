@@ -6,100 +6,31 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
-/* ===== TYPES ===== */
-
-typedef enum {
-    DIFF_EASY   = 30,
-    DIFF_MEDIUM = 45,
-    DIFF_HARD   = 55
-} Difficulty;
-
-typedef enum {
-    STATE_MENU = 0,
-    STATE_SEED_SELECT,
-    STATE_PLAYING,
-    STATE_BOT_WATCH,
-    STATE_RECORDS,
-    STATE_ABOUT,
-    STATE_HELP,
-    STATE_QUIT
-} AppState;
-
-typedef enum {
-    CELL_EMPTY  = 0,
-    CELL_GIVEN  = 1,
-    CELL_PLAYER = 2,
-    CELL_BOT    = 3
-} CellType;
-
-typedef enum {
-    LOG_INFO  = 0,
-    LOG_DEBUG = 1,
-    LOG_ERROR = 2
-} LogLevel;
-
-typedef struct {
-    char name[32];
-    int  seconds;
-    int  difficulty;
-    char date[20];
-} Record;
-
-typedef struct RecordNode {
-    Record            data;
-    struct RecordNode *next;
-} RecordNode;
-
-typedef struct {
-    int      value;
-    CellType type;
-    bool     error;
-} Cell;
-
-typedef struct {
-    Cell       board[9][9];
-    Cell       solution[9][9];
-    int        elapsed;
-    Difficulty difficulty;
-    bool       solved;
-    char       player_name[32];
-} Game;
-
-/*
- * Bot backtracking state:
- *   stack_r / stack_c / stack_v  - per-cell attempt history (up to 81 entries)
- *   stack_top                    - current depth
- *   finished                     - set when no more empty cells or contradiction
- */
-typedef struct {
-    int  stack_r[81];
-    int  stack_c[81];
-    int  stack_v[81];   /* value placed at this depth */
-    int  stack_try[81]; /* next value to try at this depth (1..9) */
-    int  stack_top;
-    bool finished;
-} BotState;
+#include "sudoku_types.h"
+#include "generate.h"
+#include "bot.h"
 
 /* ===== GLOBALS ===== */
 
-static Game        g_game;
-static AppState    g_state    = STATE_MENU;
-static RecordNode *g_records  = NULL;
-static FILE       *g_log      = NULL;
-static BotState    g_bot;
-static int         g_seed_mask   = 0;
-static bool        g_seed_cells[3][3];
-static int         g_sel_diff    = 0;
-static int         g_menu_sel    = 0;
-static int         g_cur_r       = 0;
-static int         g_cur_c       = 0;
+Game        g_game;
+AppState    g_state    = STATE_MENU;
+RecordNode *g_records  = NULL;
+FILE       *g_log      = NULL;
+BotState    g_bot;
+int         g_seed_mask   = 0;
+bool        g_seed_cells[3][3];
+int         g_sel_diff    = 0;
+int         g_menu_sel    = 0;
+int         g_cur_r       = 0;
+int         g_cur_c       = 0;
+int         g_opt_sel     = 0;   /* cursor inside Options screen */
 
 #define RECORDS_FILE "sudoku_records.dat"
 #define LOG_FILE     "sudoku.log"
 
 /* ===== LOGGING ===== */
 
-static void log_msg(LogLevel lvl, const char *fmt, ...) {
+void log_msg(LogLevel lvl, const char *fmt, ...) {
     if (!g_log) return;
     const char *lvl_str[] = {"INFO", "DEBUG", "ERROR"};
     time_t t = time(NULL);
@@ -148,193 +79,6 @@ static void records_free(void) {
         g_records = g_records->next;
         free(tmp);
     }
-}
-
-/* ===== SUDOKU CORE ===== */
-
-static bool is_valid(int board[9][9], int r, int c, int v) {
-    for (int i = 0; i < 9; i++) {
-        if (board[r][i] == v) return false;
-        if (board[i][c] == v) return false;
-    }
-    int br = (r / 3) * 3, bc = (c / 3) * 3;
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-            if (board[br+i][bc+j] == v) return false;
-    return true;
-}
-
-/*
- * Deterministic digit order derived from seed_mask.
- * For each position (0..8) we produce a digit 1..9 by rotating the
- * sequence [1..9] by a shift that depends on seed_mask and the position
- * index, then XOR-scrambling within that rotation.
- *
- * The important property: given the same seed_mask the order is always
- * identical, and different masks produce (mostly) different orders.
- */
-static void seed_digit_order(int seed_mask, int pos, int out[9]) {
-    /* LCG-style scramble seeded purely by mask + pos */
-    unsigned int s = (unsigned int)(seed_mask ^ (pos * 6364136223846793005u + 1442695040888963407u));
-    s = s * 1664525u + 1013904223u;
-    int shift = (int)(s % 9);
-
-    for (int i = 0; i < 9; i++)
-        out[i] = ((i + shift) % 9) + 1;  /* values 1..9, rotated */
-
-    /* Fisher-Yates with the same LCG */
-    for (int i = 8; i > 0; i--) {
-        s = s * 1664525u + 1013904223u;
-        int j = (int)(s % (unsigned int)(i + 1));
-        int tmp = out[i]; out[i] = out[j]; out[j] = tmp;
-    }
-}
-
-/*
- * Fill the board using backtracking.
- * Digit order at each cell is determined by seed_digit_order so that the
- * same seed always yields the same full board.
- */
-static bool fill_board_seeded(int board[9][9], int seed_mask, int pos) {
-    if (pos == 81) return true;
-    int r = pos / 9, c = pos % 9;
-    if (board[r][c] != 0) return fill_board_seeded(board, seed_mask, pos + 1);
-
-    int order[9];
-    seed_digit_order(seed_mask, pos, order);
-
-    for (int i = 0; i < 9; i++) {
-        int v = order[i];
-        if (is_valid(board, r, c, v)) {
-            board[r][c] = v;
-            if (fill_board_seeded(board, seed_mask, pos + 1)) return true;
-            board[r][c] = 0;
-        }
-    }
-    return false;
-}
-
-/*
- * Count solutions (capped at limit) for uniqueness check.
- * Uses straightforward sequential backtracking (no randomness needed here).
- */
-static int count_solutions(int board[9][9], int limit) {
-    int r = -1, c = -1;
-    for (int i = 0; i < 9 && r == -1; i++)
-        for (int j = 0; j < 9 && r == -1; j++)
-            if (board[i][j] == 0) { r = i; c = j; }
-    if (r == -1) return 1;
-    int cnt = 0;
-    for (int v = 1; v <= 9 && cnt < limit; v++) {
-        if (is_valid(board, r, c, v)) {
-            board[r][c] = v;
-            cnt += count_solutions(board, limit - cnt);
-            board[r][c] = 0;
-        }
-    }
-    return cnt;
-}
-
-/*
- * Deterministic cell removal order derived from seed_mask.
- * We fill positions[0..80] with 0..80 then shuffle using the seed.
- */
-static void seed_removal_order(int seed_mask, int positions[81]) {
-    for (int i = 0; i < 81; i++) positions[i] = i;
-    unsigned int s = (unsigned int)(seed_mask * 22695477u + 1u);
-    for (int i = 80; i > 0; i--) {
-        s = s * 1664525u + 1013904223u;
-        int j = (int)(s % (unsigned int)(i + 1));
-        int tmp = positions[i]; positions[i] = positions[j]; positions[j] = tmp;
-    }
-}
-
-/*
- * generate_sudoku:
- *   - Uses g_seed_mask and g_game.difficulty.
- *   - Same seed + same difficulty => same puzzle, every time.
- */
-static void generate_sudoku(void) {
-    int board[9][9];
-    memset(board, 0, sizeof(board));
-
-    /* Step 1: fill a complete valid board deterministically from seed */
-    fill_board_seeded(board, g_seed_mask, 0);
-
-    /* Step 2: store solution */
-    for (int i = 0; i < 9; i++)
-        for (int j = 0; j < 9; j++) {
-            g_game.solution[i][j].value = board[i][j];
-            g_game.solution[i][j].type  = CELL_GIVEN;
-            g_game.solution[i][j].error = false;
-        }
-
-    /* Step 3: remove cells in seed-deterministic order while keeping uniqueness */
-    int to_remove = (int)g_game.difficulty;
-    int positions[81];
-    seed_removal_order(g_seed_mask, positions);
-
-    int removed = 0;
-    for (int k = 0; k < 81 && removed < to_remove; k++) {
-        int r = positions[k] / 9, c = positions[k] % 9;
-        int backup = board[r][c];
-        board[r][c] = 0;
-        int tmp[9][9];
-        memcpy(tmp, board, sizeof(board));
-        if (count_solutions(tmp, 2) == 1) {
-            removed++;
-        } else {
-            board[r][c] = backup;
-        }
-    }
-
-    /* Step 4: populate the game board */
-    for (int i = 0; i < 9; i++)
-        for (int j = 0; j < 9; j++) {
-            g_game.board[i][j].value = board[i][j];
-            g_game.board[i][j].type  = (board[i][j] != 0) ? CELL_GIVEN : CELL_EMPTY;
-            g_game.board[i][j].error = false;
-        }
-
-    g_game.solved  = false;
-    g_game.elapsed = 0;
-    log_msg(LOG_INFO, "Sudoku generated: seed=%d difficulty=%d removed=%d",
-            g_seed_mask, (int)g_game.difficulty, removed);
-}
-
-/* ===== BOARD VALIDATION ===== */
-
-static void validate_board(void) {
-    for (int r = 0; r < 9; r++)
-        for (int c = 0; c < 9; c++)
-            g_game.board[r][c].error = false;
-
-    for (int r = 0; r < 9; r++) {
-        for (int c = 0; c < 9; c++) {
-            int v = g_game.board[r][c].value;
-            if (v == 0) continue;
-            for (int k = 0; k < 9; k++) {
-                if (k != c && g_game.board[r][k].value == v)
-                    g_game.board[r][c].error = true;
-                if (k != r && g_game.board[k][c].value == v)
-                    g_game.board[r][c].error = true;
-            }
-            int br = (r/3)*3, bc = (c/3)*3;
-            for (int i = 0; i < 3; i++)
-                for (int j = 0; j < 3; j++)
-                    if ((br+i != r || bc+j != c) && g_game.board[br+i][bc+j].value == v)
-                        g_game.board[r][c].error = true;
-        }
-    }
-}
-
-static bool check_solved(void) {
-    for (int r = 0; r < 9; r++)
-        for (int c = 0; c < 9; c++) {
-            if (g_game.board[r][c].value == 0) return false;
-            if (g_game.board[r][c].error)      return false;
-        }
-    return true;
 }
 
 /* ===== COLORS ===== */
@@ -400,7 +144,7 @@ static void draw_menu(void) {
         " |____/ \\___/|____/ \\___/|_|\\_\\  |_|  "
     };
     int logo_h = 5, logo_w = 42;
-    int ly = rows/2 - 7;
+    int ly = rows/2 - 8;
     int lx = (cols - logo_w) / 2;
     attron(COLOR_PAIR(COLOR_TITLE) | A_BOLD);
     for (int i = 0; i < logo_h; i++)
@@ -411,11 +155,12 @@ static void draw_menu(void) {
         "  New game  ",
         "  Bot watch  ",
         "  Records  ",
+        "  Options  ",
         "  About  ",
         "  FAQ  ",
         "  QUIT  "
     };
-    int n = 6;
+    int n = 7;
     int start_y = ly + logo_h + 2;
     for (int i = 0; i < n; i++) {
         int ix = (cols - (int)strlen(items[i])) / 2;
@@ -429,7 +174,56 @@ static void draw_menu(void) {
             attroff(COLOR_PAIR(COLOR_GRID));
         }
     }
-    mvprintw(rows-1, 2, "arrows: select   Enter: confirm   q: exit");
+    mvprintw(rows-1, 2, "Arrows: select   Enter: confirm   q: exit");
+    refresh();
+}
+
+/* ===== OPTIONS SCREEN ===== */
+
+/*
+ * Currently one option: Generator algorithm.
+ * Left/Right arrows cycle through GEN_* values for the highlighted row.
+ * Esc / q returns to the menu.
+ */
+static void draw_options(void) {
+    clear();
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    int bw = 56, bh = 10;
+    int bx = (cols - bw) / 2, by = (rows - bh) / 2;
+    draw_box_title(by, bx, bh, bw, " Options ");
+
+    /* Row 0: Generator */
+    int ry = by + 3;
+    if (g_opt_sel == 0)
+        attron(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
+    else
+        attron(COLOR_PAIR(COLOR_GRID));
+
+    mvprintw(ry, bx+3, "Generator:  < %-22s >",
+             generator_name(g_game.generator));
+
+    if (g_opt_sel == 0)
+        attroff(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
+    else
+        attroff(COLOR_PAIR(COLOR_GRID));
+
+    /* Description of the current generator */
+    const char *desc[GEN_COUNT] = {
+        "LCG seed + Fisher-Yates shuffle (default)",
+        "Xorshift32 PRNG + Fisher-Yates shuffle",
+        "Quadratic-residue slot permutation",
+        "Fibonacci (golden-ratio) hash permutation"
+    };
+    attron(COLOR_PAIR(COLOR_GRID));
+    mvprintw(ry + 2, bx+3, "  %s", desc[g_game.generator]);
+    attroff(COLOR_PAIR(COLOR_GRID));
+
+    attron(COLOR_PAIR(COLOR_GRID));
+    mvprintw(by + bh - 2, bx+3,
+             "Left/Right: change   Esc/q: back");
+    attroff(COLOR_PAIR(COLOR_GRID));
+
     refresh();
 }
 
@@ -439,13 +233,18 @@ static void draw_seed_screen(void) {
     clear();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
-    int bx = (cols - 50) / 2, by = (rows - 20) / 2;
-    draw_box_title(by, bx, 20, 50, " Generation settings ");
+    int bx = (cols - 54) / 2, by = (rows - 22) / 2;
+    draw_box_title(by, bx, 22, 54, " Generation settings ");
 
-    mvprintw(by+2, bx+2, "1. Mark cells in 3x3 (Space/Enter):");
-    mvprintw(by+3, bx+4, "   (defines the generation seed)");
+    /* Generator info line */
+    attron(COLOR_PAIR(COLOR_BOT));
+    mvprintw(by+2, bx+2, "Generator: %s", generator_name(g_game.generator));
+    attroff(COLOR_PAIR(COLOR_BOT));
 
-    int gy = by+5, gx = bx+15;
+    mvprintw(by+4, bx+2, "1. Mark cells in 3x3 grid (Space to toggle):");
+    mvprintw(by+5, bx+4, "   (defines the generation seed)");
+
+    int gy = by+7, gx = bx+17;
     for (int r = 0; r < 3; r++) {
         for (int c = 0; c < 3; c++) {
             int y = gy + r*2, x = gx + c*4;
@@ -464,25 +263,23 @@ static void draw_seed_screen(void) {
         }
     }
 
-    /* compute seed mask from checked cells */
     int mask = 0;
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++)
             if (g_seed_cells[r][c])
                 mask |= (1 << (r*3+c));
-    /* if no cells selected, display what will be used (time-based) */
     mvprintw(gy+7, bx+2, "Seed: %d (0x%03X)%s",
              mask, mask, (mask == 0) ? "  [random]" : "");
 
     const char *dnames[] = {"Easy (30 removed)", "Medium (45 removed)", "Hard (55 removed)"};
-    mvprintw(by+14, bx+2, "2. Difficulty:");
+    mvprintw(by+16, bx+2, "2. Difficulty:");
     for (int i = 0; i < 3; i++) {
         if (i == g_sel_diff) {
             attron(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
-            mvprintw(by+15+i, bx+4, "> %s", dnames[i]);
+            mvprintw(by+17+i, bx+4, "> %s", dnames[i]);
             attroff(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
         } else {
-            mvprintw(by+15+i, bx+4, "  %s", dnames[i]);
+            mvprintw(by+17+i, bx+4, "  %s", dnames[i]);
         }
     }
 
@@ -508,12 +305,13 @@ static void draw_game(bool bot_mode) {
     int di = (g_game.difficulty == DIFF_EASY) ? 0 :
              (g_game.difficulty == DIFF_MEDIUM) ? 1 : 2;
     attron(COLOR_PAIR(COLOR_TITLE) | A_BOLD);
-    mvprintw(0, GX, "SUDOKU  [%s]  Seed: %d  Time: %02d:%02d",
+    mvprintw(0, GX, "SUDOKU  [%s]  Seed: %d  Time: %02d:%02d  Gen: %s",
              diff_names[di], g_seed_mask,
-             g_game.elapsed/60, g_game.elapsed%60);
+             g_game.elapsed/60, g_game.elapsed%60,
+             generator_name(g_game.generator));
     attroff(COLOR_PAIR(COLOR_TITLE) | A_BOLD);
 
-    /* draw grid lines */
+    /* Grid lines */
     for (int i = 0; i <= 9; i++) {
         int x = GX + i * CW;
         for (int j = 0; j <= 9 * CH; j++)
@@ -532,7 +330,7 @@ static void draw_game(bool bot_mode) {
         }
     }
 
-    /* draw cells */
+    /* Cells */
     for (int r = 0; r < 9; r++) {
         for (int c = 0; c < 9; c++) {
             int y = GY + r * CH + 1;
@@ -556,7 +354,7 @@ static void draw_game(bool bot_mode) {
         }
     }
 
-    /* legend */
+    /* Legend */
     int lx = GX + 9*CW + 4;
     attron(COLOR_PAIR(COLOR_GIVEN) | A_BOLD);
     mvprintw(GY+1, lx, "# Given");
@@ -584,140 +382,8 @@ static void draw_game(bool bot_mode) {
     if (bot_mode)
         mvprintw(rows-1, 2, "q: stop watching bot");
     else
-        mvprintw(rows-1, 2, "arrows: move   1-9: enter   Del/0: erase   q: menu");
+        mvprintw(rows-1, 2, "Arrows: move   1-9: enter   Del/0: erase   q: menu");
     refresh();
-}
-
-/* ===== BOT: SEQUENTIAL BACKTRACKING ===== */
-
-/*
- * Bot solver mirrors a standard backtracking algorithm executed one step at
- * a time so the animation is visible.
- *
- * State machine per bot_step() call:
- *   - Find the first empty cell (row-major order).
- *   - If none: puzzle solved.
- *   - Try next digit (stack_try[depth]) in 1..9.
- *       - Valid: place it, push to stack, advance depth.
- *       - No valid digit found: backtrack — undo last placement, increment
- *         its try counter, continue from that cell again.
- *
- * The bot always starts from the first empty cell in reading order, matching
- * the same sequential logic used in count_solutions().
- */
-
-static void bot_init(void) {
-    g_bot.stack_top = 0;
-    g_bot.finished  = false;
-
-    /* Push initial state: start scanning from (0,0) with try=1 */
-    g_bot.stack_r[0]   = 0;
-    g_bot.stack_c[0]   = 0;
-    g_bot.stack_v[0]   = 0;
-    g_bot.stack_try[0] = 1;
-}
-
-/* Find the first empty cell in reading order at or after (r,c). */
-static bool bot_find_empty(int start_r, int start_c, int *out_r, int *out_c) {
-    for (int r = start_r; r < 9; r++) {
-        int cs = (r == start_r) ? start_c : 0;
-        for (int c = cs; c < 9; c++) {
-            if (g_game.board[r][c].value == 0) {
-                *out_r = r; *out_c = c;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/*
- * Execute one bot step.
- * Returns true if the board was modified (a cell was placed or cleared),
- * false if already finished or stuck.
- */
-static bool bot_step(void) {
-    if (g_bot.finished) return false;
-
-    /* If stack is empty we need to find the very first empty cell */
-    if (g_bot.stack_top == 0) {
-        int r, c;
-        if (!bot_find_empty(0, 0, &r, &c)) {
-            /* No empty cells: already solved */
-            g_bot.finished = true;
-            return false;
-        }
-        g_bot.stack_r[0]   = r;
-        g_bot.stack_c[0]   = c;
-        g_bot.stack_v[0]   = 0;
-        g_bot.stack_try[0] = 1;
-        g_bot.stack_top    = 1;
-    }
-
-    /* Work on top of stack */
-    while (g_bot.stack_top > 0) {
-        int depth = g_bot.stack_top - 1;
-        int r     = g_bot.stack_r[depth];
-        int c     = g_bot.stack_c[depth];
-
-        /* Erase any previously placed value at this cell */
-        if (g_game.board[r][c].value != 0 &&
-            g_game.board[r][c].type == CELL_BOT) {
-            g_game.board[r][c].value = 0;
-            g_game.board[r][c].type  = CELL_EMPTY;
-        }
-
-        /* Try digits starting from stack_try[depth] */
-        bool placed = false;
-        int tmp[9][9];
-        for (int i = 0; i < 9; i++)
-            for (int j = 0; j < 9; j++)
-                tmp[i][j] = g_game.board[i][j].value;
-
-        for (int v = g_bot.stack_try[depth]; v <= 9; v++) {
-            if (is_valid(tmp, r, c, v)) {
-                /* Place this digit */
-                g_game.board[r][c].value = v;
-                g_game.board[r][c].type  = CELL_BOT;
-                g_bot.stack_v[depth]     = v;
-                g_bot.stack_try[depth]   = v + 1; /* next try if we backtrack here */
-
-                log_msg(LOG_DEBUG, "Bot place [%d][%d]=%d depth=%d", r, c, v, depth);
-
-                /* Find next empty cell (scan from next position in reading order) */
-                int nr, nc;
-                int next_r = (c + 1 < 9) ? r : r + 1;
-                int next_c = (c + 1 < 9) ? c + 1 : 0;
-                if (!bot_find_empty(next_r, next_c, &nr, &nc)) {
-                    /* No more empty cells => solved */
-                    g_bot.finished = true;
-                    return true;
-                }
-
-                /* Push next cell */
-                int nd = g_bot.stack_top;
-                g_bot.stack_r[nd]   = nr;
-                g_bot.stack_c[nd]   = nc;
-                g_bot.stack_v[nd]   = 0;
-                g_bot.stack_try[nd] = 1;
-                g_bot.stack_top++;
-
-                placed = true;
-                return true; /* one visual step done */
-            }
-        }
-
-        if (!placed) {
-            /* Backtrack */
-            log_msg(LOG_DEBUG, "Bot backtrack at [%d][%d] depth=%d", r, c, depth);
-            g_bot.stack_top--;
-            /* The erase at the top of the loop will clear this cell next iter */
-        }
-    }
-
-    /* Stack exhausted without solution (shouldn't happen on valid puzzle) */
-    g_bot.finished = true;
-    return false;
 }
 
 /* ===== RECORDS SCREEN ===== */
@@ -743,7 +409,7 @@ static void draw_records(void) {
                  n->data.date);
         n = n->next;
     }
-    if (!g_records) mvprintw(6, 4, "(no records)");
+    if (!g_records) mvprintw(6, 4, "(no records yet)");
     mvprintw(rows-2, 4, "Esc / q: back");
     refresh();
 }
@@ -789,13 +455,17 @@ static void draw_help(void) {
     const char *lines[] = {
         "",
         " MAIN MENU:",
-        "   Arrows Up/Down       - select menu option",
+        "   Arrows Up/Down       - select menu item",
         "   Enter                - confirm",
         "   q                    - exit",
         "",
+        " OPTIONS:",
+        "   Arrows Left/Right    - cycle generator algorithm",
+        "   Esc / q              - back to menu",
+        "",
         " SEED SELECTION:",
         "   Arrows               - move in 3x3 grid",
-        "   Space / Enter        - toggle cell (seed bit)",
+        "   Space                - toggle seed cell",
         "   Tab                  - change difficulty",
         "   Enter                - generate and start game",
         "   Esc                  - return to menu",
@@ -812,7 +482,7 @@ static void draw_help(void) {
         "",
         " SEED:",
         "   Mark cells in the 3x3 grid to set a 9-bit seed.",
-        "   Same seed + same difficulty => identical puzzle.",
+        "   Same seed + difficulty + generator => same puzzle.",
         "   Empty grid => random seed based on current time.",
         "",
         " FILES:",
@@ -844,37 +514,53 @@ static void input_name(void) {
 }
 
 /* ===== ENTER KEY MACRO ===== */
-/*
- * PDCurses on Windows returns '\r' for Enter; ncurses returns '\n'.
- * KEY_ENTER is the numpad Enter. Check all three.
- */
+
 #define IS_ENTER(ch) ((ch) == '\n' || (ch) == '\r' || (ch) == KEY_ENTER)
 
 /* ===== STATE HANDLERS ===== */
 
 static void handle_menu(int ch) {
-    int n = 6;
+    int n = 7;
     if (ch == KEY_UP)   g_menu_sel = (g_menu_sel + n - 1) % n;
     if (ch == KEY_DOWN) g_menu_sel = (g_menu_sel + 1) % n;
     if (IS_ENTER(ch)) {
         switch (g_menu_sel) {
-            case 0:
+            case 0: /* New game */
                 g_cur_r = 0; g_cur_c = 0;
                 memset(g_seed_cells, 0, sizeof(g_seed_cells));
+                memset(g_game.player_name, 0, sizeof(g_game.player_name));
                 g_state = STATE_SEED_SELECT;
                 break;
-            case 1:
+            case 1: /* Bot watch */
                 g_cur_r = 0; g_cur_c = 0;
                 memset(g_seed_cells, 0, sizeof(g_seed_cells));
                 strcpy(g_game.player_name, "__BOT__");
                 g_state = STATE_SEED_SELECT;
                 break;
             case 2: g_state = STATE_RECORDS; break;
-            case 3: g_state = STATE_ABOUT;   break;
-            case 4: g_state = STATE_HELP;    break;
-            case 5: g_state = STATE_QUIT;    break;
+            case 3: g_state = STATE_OPTIONS; g_opt_sel = 0; break;
+            case 4: g_state = STATE_ABOUT;   break;
+            case 5: g_state = STATE_HELP;    break;
+            case 6: g_state = STATE_QUIT;    break;
         }
     }
+}
+
+static void handle_options(int ch) {
+    if (ch == 27 || ch == 'q' || ch == 'Q') {
+        g_state = STATE_MENU;
+        return;
+    }
+    /* Only one option row (g_opt_sel == 0): generator */
+    if (g_opt_sel == 0) {
+        if (ch == KEY_LEFT)
+            g_game.generator = (GeneratorType)
+                ((g_game.generator + GEN_COUNT - 1) % GEN_COUNT);
+        if (ch == KEY_RIGHT)
+            g_game.generator = (GeneratorType)
+                ((g_game.generator + 1) % GEN_COUNT);
+    }
+    /* Arrow up/down reserved for future options */
 }
 
 static void handle_seed(int ch) {
@@ -895,7 +581,6 @@ static void handle_seed(int ch) {
         Difficulty diffs[] = {DIFF_EASY, DIFF_MEDIUM, DIFF_HARD};
         g_game.difficulty = diffs[g_sel_diff];
 
-        /* Build seed mask */
         g_seed_mask = 0;
         for (int r = 0; r < 3; r++)
             for (int c = 0; c < 3; c++)
@@ -904,11 +589,6 @@ static void handle_seed(int ch) {
         if (g_seed_mask == 0)
             g_seed_mask = (int)(time(NULL) & 0x1FF);
 
-        /*
-         * srand is only used internally by legacy code; generation now uses
-         * seed_digit_order / seed_removal_order which are fully deterministic.
-         * We still seed the C rand() for any unrelated future use.
-         */
         srand((unsigned)g_seed_mask);
 
         generate_sudoku();
@@ -921,8 +601,9 @@ static void handle_seed(int ch) {
         } else {
             g_state = STATE_PLAYING;
         }
-        log_msg(LOG_INFO, "Game started: seed=%d diff=%d bot=%d",
-                g_seed_mask, (int)g_game.difficulty, bot_mode ? 1 : 0);
+        log_msg(LOG_INFO, "Game started: seed=%d diff=%d gen=%d bot=%d",
+                g_seed_mask, (int)g_game.difficulty,
+                (int)g_game.generator, bot_mode ? 1 : 0);
     }
 }
 
@@ -980,7 +661,7 @@ static void print_help_cli(const char *prog) {
     printf("  --version      Show version and exit\n");
     printf("\nDescription:\n");
     printf("  Console Sudoku with deterministic seed-based generation.\n");
-    printf("  Same seed + same difficulty always gives the same puzzle.\n");
+    printf("  Same seed + same difficulty + same generator => same puzzle.\n");
     printf("\nIn-game controls:\n");
     printf("  Arrows          - navigate\n");
     printf("  1-9             - enter digit\n");
@@ -1004,7 +685,7 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         if (strcmp(argv[i], "--version") == 0) {
-            printf("sudoku v0.2  2026\n");
+            printf("sudoku v0.3  2026\n");
             return 0;
         }
     }
@@ -1013,6 +694,9 @@ int main(int argc, char *argv[]) {
     log_msg(LOG_INFO, "=== sudoku started ===");
 
     records_load();
+
+    /* Default game settings */
+    g_game.generator = GEN_LCG;
 
     initscr();
     cbreak();
@@ -1045,6 +729,7 @@ int main(int argc, char *argv[]) {
             case STATE_PLAYING:     draw_game(false);   break;
             case STATE_BOT_WATCH:   draw_game(true);    break;
             case STATE_RECORDS:     draw_records();     break;
+            case STATE_OPTIONS:     draw_options();     break;
             case STATE_ABOUT:       draw_about();       break;
             case STATE_HELP:        draw_help();        break;
             default: break;
@@ -1052,7 +737,7 @@ int main(int argc, char *argv[]) {
 
         /* Input with bot animation */
         if (g_state == STATE_BOT_WATCH) {
-            halfdelay(1); /* ~100 ms timeout */
+            halfdelay(1);
         } else {
             nocbreak();
             cbreak();
@@ -1064,7 +749,6 @@ int main(int argc, char *argv[]) {
             nocbreak(); cbreak();
             if (ch == 'q' || ch == 'Q') { g_state = STATE_MENU; continue; }
             if (ch == ERR || ch == KEY_RESIZE) {
-                /* Advance bot one step per tick (~100 ms) */
                 if (!g_bot.finished) {
                     bot_step();
                     if (g_bot.finished || check_solved()) {
@@ -1080,16 +764,18 @@ int main(int argc, char *argv[]) {
 
         if (ch == ERR) continue;
 
-        if ((g_state == STATE_RECORDS || g_state == STATE_ABOUT || g_state == STATE_HELP)
+        if ((g_state == STATE_RECORDS || g_state == STATE_ABOUT ||
+             g_state == STATE_HELP)
             && (ch == 27 || ch == 'q' || ch == 'Q')) {
             g_state = STATE_MENU;
             continue;
         }
 
         switch (g_state) {
-            case STATE_MENU:        handle_menu(ch); break;
-            case STATE_SEED_SELECT: handle_seed(ch); break;
-            case STATE_PLAYING:     handle_game(ch); break;
+            case STATE_MENU:        handle_menu(ch);    break;
+            case STATE_OPTIONS:     handle_options(ch); break;
+            case STATE_SEED_SELECT: handle_seed(ch);    break;
+            case STATE_PLAYING:     handle_game(ch);    break;
             default: break;
         }
 

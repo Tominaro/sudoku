@@ -1,0 +1,42 @@
+# depslib dependency file v1.0
+1778944264 source:c:\users\georgy\documents\codeblocks\sudoku\generate.c
+	"generate.h"
+	"sudoku_types.h"
+	<string.h>
+	<stdlib.h>
+	<stdio.h>
+
+1778944264 c:\users\georgy\documents\codeblocks\sudoku\generate.h
+	<stdbool.h>
+	"sudoku_types.h"
+
+1778944705 c:\users\georgy\documents\codeblocks\sudoku\sudoku_types.h
+	<stdbool.h>
+
+1778944265 source:c:\users\georgy\documents\codeblocks\sudoku\bot.c
+	"bot.h"
+	"sudoku_types.h"
+	<stdio.h>
+
+1778944265 c:\users\georgy\documents\codeblocks\sudoku\bot.h
+	<stdbool.h>
+
+1778944272 source:c:\users\georgy\documents\codeblocks\sudoku\main.c
+	<curses.h>
+	<string.h>
+	<stdlib.h>
+	<stdio.h>
+	<time.h>
+	<stdbool.h>
+	<stdarg.h>
+	"sudoku_types.h"
+	"generate.h"
+	"bot.h"
+
+1778942136 c:\users\georgy\documents\codeblocks\sudoku\include\curses.h
+	<stdarg.h>
+	<stddef.h>
+	<stdio.h>
+	<wchar.h>
+	<stdbool.h>
+
