@@ -21,7 +21,7 @@
 1778944265 c:\users\georgy\documents\codeblocks\sudoku\bot.h
 	<stdbool.h>
 
-1778944272 source:c:\users\georgy\documents\codeblocks\sudoku\main.c
+1779040505 source:c:\users\georgy\documents\codeblocks\sudoku\main.c
 	<curses.h>
 	<string.h>
 	<stdlib.h>
