@@ -735,9 +735,15 @@ int main(int argc, char *argv[]) {
             default: break;
         }
 
-        /* Input with bot animation */
-        if (g_state == STATE_BOT_WATCH) {
-            halfdelay(1);
+        /*
+         * Input timeout:
+         *   BOT_WATCH  — halfdelay(1) so the bot animates ~10 steps/sec.
+         *   PLAYING    — halfdelay(10) so the timer updates every second
+         *                even when the player is idle (getch returns ERR).
+         *   everything else — blocking getch (no timeout needed).
+         */
+        if (g_state == STATE_BOT_WATCH || g_state == STATE_PLAYING) {
+            halfdelay(g_state == STATE_BOT_WATCH ? 1 : 10);
         } else {
             nocbreak();
             cbreak();
@@ -745,8 +751,13 @@ int main(int argc, char *argv[]) {
 
         int ch = getch();
 
+        /* Restore blocking mode after a timed getch */
+        if (g_state == STATE_BOT_WATCH || g_state == STATE_PLAYING) {
+            nocbreak();
+            cbreak();
+        }
+
         if (g_state == STATE_BOT_WATCH) {
-            nocbreak(); cbreak();
             if (ch == 'q' || ch == 'Q') { g_state = STATE_MENU; continue; }
             if (ch == ERR || ch == KEY_RESIZE) {
                 if (!g_bot.finished) {
@@ -762,6 +773,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        /* ERR from halfdelay timeout during PLAYING — just loop to update timer */
         if (ch == ERR) continue;
 
         if ((g_state == STATE_RECORDS || g_state == STATE_ABOUT ||
@@ -778,8 +790,6 @@ int main(int argc, char *argv[]) {
             case STATE_PLAYING:     handle_game(ch);    break;
             default: break;
         }
-
-        last_tick = time(NULL);
     }
 
     endwin();
