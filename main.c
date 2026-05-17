@@ -24,6 +24,7 @@ int         g_menu_sel    = 0;
 int         g_cur_r       = 0;
 int         g_cur_c       = 0;
 int         g_opt_sel     = 0;   /* cursor inside Options screen */
+int         g_scale       = 100; /* window scale %: 50 / 75 / 100 / 125 / 150 */
 
 #define RECORDS_FILE "sudoku_records.dat"
 #define LOG_FILE     "sudoku.log"
@@ -91,6 +92,117 @@ static void records_free(void) {
 #define COLOR_BOT      6
 #define COLOR_TITLE    7
 #define COLOR_BUTTON   8
+/* Fire color pairs 9..14 (fg on black bg) */
+#define COLOR_FIRE_BASE 9
+#define FIRE_LEVELS     6
+
+/* ===== FIRE SIMULATION ===== */
+
+/*
+ * FIRE_COLS  : width of each side strip in terminal columns.
+ * FIRE_ROWS  : max height the simulation tracks (more than screen height is fine).
+ * FIRE_MAX   : maximum heat value (15 = hottest).
+ *
+ * Left strip  (g_fire_l): wind bias +1 (flames lean right, i.e. inward).
+ * Right strip (g_fire_r): wind bias -1 (flames lean left,  i.e. inward).
+ * This makes both fires appear to billow toward the centre of the screen.
+ */
+#define FIRE_COLS  35
+#define FIRE_ROWS  120
+#define FIRE_MAX   12
+
+/* Fixed base window dimensions (scaled by g_scale in apply_scale / main). */
+#define BASE_COLS 120
+#define BASE_ROWS  35
+
+static int g_fire_l[FIRE_ROWS][FIRE_COLS];
+static int g_fire_r[FIRE_ROWS][FIRE_COLS];
+
+static unsigned int g_fire_rng = 12345u;
+static inline int fire_rand(void) {
+    g_fire_rng = g_fire_rng * 1664525u + 1013904223u;
+    return (int)((g_fire_rng >> 16) & 0x7FFF);
+}
+
+static void fire_init(void) {
+    for (int c = 0; c < FIRE_COLS; c++) {
+        g_fire_l[FIRE_ROWS-1][c] = FIRE_MAX;
+        g_fire_r[FIRE_ROWS-1][c] = FIRE_MAX;
+    }
+}
+
+/*
+ * wind_bias: +1 = lean right (left strip), -1 = lean left (right strip).
+ * Decay is 0 or 1 only — keeps flames tall and fast.
+ */
+static void fire_step_buf(int buf[FIRE_ROWS][FIRE_COLS], int wind_bias) {
+    /* Re-ignite bottom row with full heat, slight flicker */
+    for (int c = 0; c < FIRE_COLS; c++) {
+        int v = FIRE_MAX - (fire_rand() % 2);
+        buf[FIRE_ROWS-1][c] = (v < 0) ? 0 : v;
+    }
+    /* Propagate upward with wind bias */
+    for (int r = 0; r < FIRE_ROWS-1; r++) {
+        for (int c = 0; c < FIRE_COLS; c++) {
+            /* Biased horizontal sample: 0, bias, or 2*bias clamped */
+            int rn = fire_rand() % 3;   /* 0, 1, 2 */
+            int dc = (rn == 0) ? 0 : (rn == 1) ? wind_bias : wind_bias * 2;
+            int sc = c + dc;
+            if (sc < 0) sc = 0;
+            if (sc >= FIRE_COLS) sc = FIRE_COLS-1;
+            int heat  = buf[r+1][sc];
+            int decay = fire_rand() % 2; /* 0 or 1 — gentle decay = taller fire */
+            heat -= decay;
+            buf[r][c] = (heat < 0) ? 0 : heat;
+        }
+    }
+}
+
+static void fire_step(void) {
+    fire_step_buf(g_fire_l, +1); /* left strip: lean right (inward) */
+    fire_step_buf(g_fire_r, -1); /* right strip: lean left (inward) */
+}
+
+/*
+ * Render one fire strip at screen column screen_x.
+ * safe_top: rows above this y are NOT drawn (protects hint line and content).
+ * mirror:   if true, render columns right-to-left (right strip reads outward).
+ *
+ * Heat -> glyph + colour:
+ *   1-3   '.' dim red
+ *   4-6   '*' red bold
+ *   7-9   '*' bright-red bold
+ *  10-11  '#' yellow bold
+ *  12-13  '#' bright-yellow bold
+ *  14+    '@' white bold  (core)
+ */
+static void draw_fire_buf(int buf[FIRE_ROWS][FIRE_COLS],
+                          int screen_x, int rows, int safe_top, bool mirror) {
+    /* Bottom of fire aligns with rows-2 (row rows-1 is the hint line) */
+    int base_y = rows - 2;
+    for (int r = FIRE_ROWS-1; r >= 0; r--) {
+        int sy = base_y - (FIRE_ROWS-1 - r);
+        if (sy < safe_top || sy < 0 || sy >= rows) continue;
+        for (int c = 0; c < FIRE_COLS; c++) {
+            int heat = buf[r][c];
+            if (heat <= 0) continue;
+            int pair;
+            chtype glyph;
+            if      (heat <= 3)  { pair = COLOR_FIRE_BASE+0; glyph = '.'; }
+            else if (heat <= 6)  { pair = COLOR_FIRE_BASE+1; glyph = '*'; }
+            else if (heat <= 9)  { pair = COLOR_FIRE_BASE+2; glyph = '*'; }
+            else if (heat <= 11) { pair = COLOR_FIRE_BASE+3; glyph = '#'; }
+            else if (heat <= 13) { pair = COLOR_FIRE_BASE+4; glyph = '#'; }
+            else                 { pair = COLOR_FIRE_BASE+5; glyph = '@'; }
+            int attr = COLOR_PAIR(pair) | A_BOLD;
+            attron(attr);
+            /* mirror: right strip columns are reversed so col 0 is outermost */
+            int sc = mirror ? (FIRE_COLS-1 - c) : c;
+            mvaddch(sy, screen_x + sc, glyph);
+            attroff(attr);
+        }
+    }
+}
 
 static void init_colors(void) {
     start_color();
@@ -103,6 +215,13 @@ static void init_colors(void) {
     init_pair(COLOR_BOT,      COLOR_MAGENTA, COLOR_BLACK);
     init_pair(COLOR_TITLE,    COLOR_YELLOW,  COLOR_BLACK);
     init_pair(COLOR_BUTTON,   COLOR_BLACK,   COLOR_WHITE);
+    /* Fire pairs */
+    init_pair(COLOR_FIRE_BASE+0, COLOR_RED,    COLOR_BLACK);
+    init_pair(COLOR_FIRE_BASE+1, COLOR_RED,    COLOR_BLACK);
+    init_pair(COLOR_FIRE_BASE+2, COLOR_RED,    COLOR_BLACK);
+    init_pair(COLOR_FIRE_BASE+3, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(COLOR_FIRE_BASE+4, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(COLOR_FIRE_BASE+5, COLOR_WHITE,  COLOR_BLACK);
 }
 
 /* ===== BOX DRAWING ===== */
@@ -135,6 +254,14 @@ static void draw_menu(void) {
     clear();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
+
+    /* Fire strips: each FIRE_COLS wide, capped above the hint line.
+     * safe_top keeps flames out of the logo+menu area (upper half).
+     * Left strip leans right (mirror=false), right strip leans left (mirror=true). */
+    int fire_safe = rows / 2 - 6;  /* flames only in lower half */
+    if (fire_safe < 1) fire_safe = 1;
+    draw_fire_buf(g_fire_l, 0,                rows, fire_safe, false);
+    draw_fire_buf(g_fire_r, cols - FIRE_COLS, rows, fire_safe, true);
 
     const char *logo[] = {
         "  ____  _   _ ____   ___  _  ___  _   _ ",
@@ -189,26 +316,19 @@ static void draw_options(void) {
     clear();
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
-    int bw = 56, bh = 10;
+    int bw = 58, bh = 14;
     int bx = (cols - bw) / 2, by = (rows - bh) / 2;
     draw_box_title(by, bx, bh, bw, " Options ");
 
     /* Row 0: Generator */
     int ry = by + 3;
-    if (g_opt_sel == 0)
-        attron(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
-    else
-        attron(COLOR_PAIR(COLOR_GRID));
-
-    mvprintw(ry, bx+3, "Generator:  < %-22s >",
+    if (g_opt_sel == 0) attron(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
+    else                attron(COLOR_PAIR(COLOR_GRID));
+    mvprintw(ry, bx+3, "Generator:   < %-22s >",
              generator_name(g_game.generator));
+    if (g_opt_sel == 0) attroff(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
+    else                attroff(COLOR_PAIR(COLOR_GRID));
 
-    if (g_opt_sel == 0)
-        attroff(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
-    else
-        attroff(COLOR_PAIR(COLOR_GRID));
-
-    /* Description of the current generator */
     const char *desc[GEN_COUNT] = {
         "LCG seed + Fisher-Yates shuffle (default)",
         "Xorshift32 PRNG + Fisher-Yates shuffle",
@@ -216,12 +336,26 @@ static void draw_options(void) {
         "Fibonacci (golden-ratio) hash permutation"
     };
     attron(COLOR_PAIR(COLOR_GRID));
-    mvprintw(ry + 2, bx+3, "  %s", desc[g_game.generator]);
+    mvprintw(ry + 1, bx+5, "%s", desc[g_game.generator]);
+    attroff(COLOR_PAIR(COLOR_GRID));
+
+    /* Row 1: Scale */
+    int sy = ry + 4;
+    if (g_opt_sel == 1) attron(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
+    else                attron(COLOR_PAIR(COLOR_GRID));
+    mvprintw(sy, bx+3, "Window scale: < %3d%% >  [50/75/100/125/150]",
+             g_scale);
+    if (g_opt_sel == 1) attroff(COLOR_PAIR(COLOR_SELECTED) | A_BOLD);
+    else                attroff(COLOR_PAIR(COLOR_GRID));
+
+    attron(COLOR_PAIR(COLOR_GRID));
+    mvprintw(sy + 1, bx+5,
+             "Takes effect on next launch (resize_term applied now)");
     attroff(COLOR_PAIR(COLOR_GRID));
 
     attron(COLOR_PAIR(COLOR_GRID));
     mvprintw(by + bh - 2, bx+3,
-             "Left/Right: change   Esc/q: back");
+             "Up/Down: row   Left/Right: change   Esc/q: back");
     attroff(COLOR_PAIR(COLOR_GRID));
 
     refresh();
@@ -323,7 +457,7 @@ static void draw_game(bool bot_mode) {
         for (int j = 0; j <= 9 * CW; j++) {
             int x = GX + j;
             chtype cur = mvinch(y, x);
-            if ((cur & A_CHARTEXT) == ACS_VLINE)
+            if ((cur & A_CHARTEXT) == (ACS_VLINE & A_CHARTEXT))
                 mvaddch(y, x, ACS_PLUS);
             else
                 mvaddch(y, x, thick ? ACS_HLINE : '-');
@@ -546,21 +680,46 @@ static void handle_menu(int ch) {
     }
 }
 
+/* Scale steps: 50, 75, 100, 125, 150 */
+static const int SCALE_STEPS[] = {50, 75, 100, 125, 150};
+#define SCALE_N 5
+
+static void apply_scale(void) {
+    int want_cols = BASE_COLS * g_scale / 100;
+    int want_rows = BASE_ROWS * g_scale / 100;
+    if (want_cols < 60)  want_cols = 60;
+    if (want_rows < 18)  want_rows = 18;
+    resize_term(want_rows, want_cols);
+    /* Re-init fire buffers to match new height */
+    fire_init();
+}
+
 static void handle_options(int ch) {
     if (ch == 27 || ch == 'q' || ch == 'Q') {
         g_state = STATE_MENU;
         return;
     }
-    /* Only one option row (g_opt_sel == 0): generator */
+    if (ch == KEY_UP)   g_opt_sel = (g_opt_sel + 1) % 2;
+    if (ch == KEY_DOWN) g_opt_sel = (g_opt_sel + 1) % 2;
+
     if (g_opt_sel == 0) {
+        /* Generator row */
         if (ch == KEY_LEFT)
             g_game.generator = (GeneratorType)
                 ((g_game.generator + GEN_COUNT - 1) % GEN_COUNT);
         if (ch == KEY_RIGHT)
             g_game.generator = (GeneratorType)
                 ((g_game.generator + 1) % GEN_COUNT);
+    } else {
+        /* Scale row: find current step, move left/right */
+        int idx = 2; /* default 100% */
+        for (int i = 0; i < SCALE_N; i++)
+            if (SCALE_STEPS[i] == g_scale) { idx = i; break; }
+        if (ch == KEY_LEFT  && idx > 0)          idx--;
+        if (ch == KEY_RIGHT && idx < SCALE_N-1)  idx++;
+        g_scale = SCALE_STEPS[idx];
+        apply_scale();
     }
-    /* Arrow up/down reserved for future options */
 }
 
 static void handle_seed(int ch) {
@@ -698,17 +857,26 @@ int main(int argc, char *argv[]) {
     /* Default game settings */
     g_game.generator = GEN_LCG;
 
+    /* Apply window size according to g_scale (BASE_COLS/BASE_ROWS defined at file scope). */
     initscr();
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
     nodelay(stdscr, FALSE);
+    {
+        int want_cols = BASE_COLS * g_scale / 100;
+        int want_rows = BASE_ROWS * g_scale / 100;
+        if (want_cols < 60)  want_cols = 60;
+        if (want_rows < 18)  want_rows = 18;
+        resize_term(want_rows, want_cols);
+    }
 
     if (has_colors()) init_colors();
 
     srand((unsigned)time(NULL));
     memset(g_game.player_name, 0, sizeof(g_game.player_name));
+    fire_init();
 
     time_t last_tick = time(NULL);
 
@@ -737,13 +905,17 @@ int main(int argc, char *argv[]) {
 
         /*
          * Input timeout:
-         *   BOT_WATCH  — halfdelay(1) so the bot animates ~10 steps/sec.
-         *   PLAYING    — halfdelay(10) so the timer updates every second
-         *                even when the player is idle (getch returns ERR).
-         *   everything else — blocking getch (no timeout needed).
+         *   BOT_WATCH  — halfdelay(1) ~20 steps/sec (two bot_step() calls
+         *                per tick double effective speed without visual blur).
+         *   PLAYING    — halfdelay(10) so the timer updates every second.
+         *   STATE_MENU — halfdelay(1) for fire animation.
+         *   everything else — blocking getch.
          */
-        if (g_state == STATE_BOT_WATCH || g_state == STATE_PLAYING) {
-            halfdelay(g_state == STATE_BOT_WATCH ? 1 : 10);
+        if (g_state == STATE_BOT_WATCH || g_state == STATE_PLAYING ||
+            g_state == STATE_MENU) {
+            int delay = (g_state == STATE_BOT_WATCH) ? 1 :
+                        (g_state == STATE_PLAYING)   ? 10 : 1;
+            halfdelay(delay);
         } else {
             nocbreak();
             cbreak();
@@ -752,7 +924,8 @@ int main(int argc, char *argv[]) {
         int ch = getch();
 
         /* Restore blocking mode after a timed getch */
-        if (g_state == STATE_BOT_WATCH || g_state == STATE_PLAYING) {
+        if (g_state == STATE_BOT_WATCH || g_state == STATE_PLAYING ||
+            g_state == STATE_MENU) {
             nocbreak();
             cbreak();
         }
@@ -761,20 +934,43 @@ int main(int argc, char *argv[]) {
             if (ch == 'q' || ch == 'Q') { g_state = STATE_MENU; continue; }
             if (ch == ERR || ch == KEY_RESIZE) {
                 if (!g_bot.finished) {
-                    bot_step();
-                    if (g_bot.finished || check_solved()) {
-                        g_game.solved = true;
-                        log_msg(LOG_INFO, "Bot finished solving.");
-                        napms(1500);
-                        g_state = STATE_MENU;
+                    /* Two steps per timeout tick — doubles animation speed. */
+                    for (int _s = 0; _s < 2 && !g_bot.finished; _s++) {
+                        bot_step();
+                        if (g_bot.finished || check_solved()) {
+                            g_game.solved = true;
+                            log_msg(LOG_INFO, "Bot finished solving.");
+                            /* Redraw once so the player sees the completed board. */
+                            draw_game(true);
+                            /* Show a prompt and wait for Enter or q. */
+                            int rows_tmp, cols_tmp;
+                            getmaxyx(stdscr, rows_tmp, cols_tmp);
+                            attron(COLOR_PAIR(COLOR_TITLE) | A_BOLD);
+                            mvprintw(rows_tmp - 1, 2,
+                                     "Solved! Press Enter to return to menu...");
+                            attroff(COLOR_PAIR(COLOR_TITLE) | A_BOLD);
+                            refresh();
+                            nocbreak(); cbreak(); nodelay(stdscr, FALSE);
+                            int wait_ch;
+                            do {
+                                wait_ch = getch();
+                            } while (!IS_ENTER(wait_ch) &&
+                                     wait_ch != 'q' && wait_ch != 'Q' &&
+                                     wait_ch != 27);
+                            g_state = STATE_MENU;
+                            break;
+                        }
                     }
                 }
             }
             continue;
         }
 
-        /* ERR from halfdelay timeout during PLAYING — just loop to update timer */
-        if (ch == ERR) continue;
+        /* ERR from halfdelay timeout: update timer (PLAYING) or advance fire (MENU) */
+        if (ch == ERR) {
+            if (g_state == STATE_MENU) fire_step();
+            continue;
+        }
 
         if ((g_state == STATE_RECORDS || g_state == STATE_ABOUT ||
              g_state == STATE_HELP)
