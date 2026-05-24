@@ -4,12 +4,27 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /*
  * generate.c -- Sudoku puzzle generation.
  *
- * Four fully deterministic digit-order algorithms are implemented.
- * All shared state lives in main.c (g_game, g_seed_mask, g_log).
+ * Counters logged to sudoku.log after each generate_sudoku() call:
+ *
+ *   fill_calls      : recursive calls inside fill_board_seeded()
+ *                     (each call = one cell placement attempt or backtrack)
+ *   fill_is_valid   : is_valid() calls inside fill_board_seeded()
+ *   fill_placements : successful digit placements (board[r][c] = v)
+ *   fill_backtracks : backtrack events (board[r][c] = 0)
+ *
+ *   removal_candidates : cells tried for removal (loop iterations)
+ *   removal_count_calls: count_solutions() top-level calls (one per candidate)
+ *   cs_is_valid        : is_valid() calls inside all count_solutions() runs
+ *   cs_nodes           : recursive nodes explored inside all count_solutions()
+ *   removed            : cells successfully removed (unique-solution confirmed)
+ *
+ * These counters let you empirically measure the cost of each phase
+ * and compare against the theoretical O(9^d) bound from the report.
  */
 
 /* ===== EXTERN GLOBALS (defined in main.c) ===== */
@@ -19,6 +34,24 @@ extern int   g_seed_mask;
 extern FILE *g_log;
 
 void log_msg(int lvl, const char *fmt, ...);
+
+/* ===== GENERATION COUNTERS ===== */
+
+typedef struct {
+    long fill_calls;       /* fill_board_seeded() recursive invocations    */
+    long fill_is_valid;    /* is_valid() calls inside fill phase            */
+    long fill_placements;  /* successful digit placements                   */
+    long fill_backtracks;  /* backtrack events (cell reset to 0)            */
+
+    long removal_candidates; /* cells tried for removal                    */
+    long removal_count_calls;/* count_solutions() invocations (top-level)  */
+    long cs_nodes;           /* recursive nodes inside all count_solutions  */
+    long cs_is_valid;        /* is_valid() calls inside count_solutions     */
+    long removed;            /* cells actually removed                      */
+} GenCounters;
+
+/* Active counters during a generate_sudoku() call; zeroed at start. */
+static GenCounters gc;
 
 /* ===== GENERATOR NAMES ===== */
 
@@ -46,23 +79,15 @@ bool is_valid(int board[9][9], int r, int c, int v) {
     return true;
 }
 
-/* ===== ALGORITHM 1: LCG + Fisher-Yates (original) =====
- *
- * A 32-bit LCG seeded by (seed_mask XOR pos-mixed constant) produces a
- * shift; after rotating [1..9] by that shift a second Fisher-Yates pass
- * shuffles with the same LCG stream.  The combination is fast and has
- * reasonable avalanche for small seeds.
- */
+/* ===== ALGORITHM 1: LCG + Fisher-Yates ===== */
+
 void digit_order_lcg(int seed_mask, int pos, int out[9]) {
     unsigned int s = (unsigned int)(seed_mask ^
         ((unsigned int)pos * 6364136223846793005u + 1442695040888963407u));
     s = s * 1664525u + 1013904223u;
     int shift = (int)(s % 9);
-
     for (int i = 0; i < 9; i++)
-        out[i] = ((i + shift) % 9) + 1;          /* rotate 1..9 */
-
-    /* Fisher-Yates with the same LCG stream */
+        out[i] = ((i + shift) % 9) + 1;
     for (int i = 8; i > 0; i--) {
         s = s * 1664525u + 1013904223u;
         int j = (int)(s % (unsigned int)(i + 1));
@@ -70,26 +95,17 @@ void digit_order_lcg(int seed_mask, int pos, int out[9]) {
     }
 }
 
-/* ===== ALGORITHM 2: Xorshift32 + Fisher-Yates =====
- *
- * xorshift32 has a period of 2^32-1 and much better bit-mixing than a
- * plain LCG.  The seed is derived from (seed_mask, pos) via two mixing
- * steps so that even seed=0 never collapses the state to 0.
- * A standard Fisher-Yates pass then permutes [1..9].
- */
+/* ===== ALGORITHM 2: Xorshift32 + Fisher-Yates ===== */
+
 void digit_order_xorshift(int seed_mask, int pos, int out[9]) {
-    /* Mix seed_mask and pos into a non-zero 32-bit state */
     unsigned int s = (unsigned int)seed_mask * 2246822519u
                    ^ (unsigned int)(pos + 1)  * 3266489917u;
     s ^= s >> 16;
     s *= 2246822519u;
     s ^= s >> 13;
-    if (s == 0) s = 0xdeadbeef;   /* xorshift must not start at 0 */
-
-    for (int i = 0; i < 9; i++) out[i] = i + 1;  /* [1..9] */
-
+    if (s == 0) s = 0xdeadbeef;
+    for (int i = 0; i < 9; i++) out[i] = i + 1;
     for (int i = 8; i > 0; i--) {
-        /* xorshift32 step */
         s ^= s << 13;
         s ^= s >> 17;
         s ^= s << 5;
@@ -98,70 +114,38 @@ void digit_order_xorshift(int seed_mask, int pos, int out[9]) {
     }
 }
 
-/* ===== ALGORITHM 3: Quadratic-residue permutation =====
- *
- * A quadratic permutation polynomial over Z/9Z maps index k ->
- *   (a*k^2 + b*k + c) mod 9
- * where the coefficients a, b, c are derived from the seed and pos.
- * If the mapping is not a bijection (gcd(a,9) != 1 etc.) we fall back
- * to the natural order for that position -- the backtracker corrects
- * conflicts anyway and the seed still determines which digits are tried
- * first.  No swap pass is required; the permutation is computed directly.
- *
- * Why quadratic?  It is a textbook method (used in hash-table probing)
- * and gives good dispersion without needing a shuffle loop.
- */
+/* ===== ALGORITHM 3: Quadratic-residue permutation ===== */
+
 void digit_order_quadratic(int seed_mask, int pos, int out[9]) {
-    /* Derive three small coefficients from the seed */
     unsigned int h = (unsigned int)seed_mask * 2654435761u
                    ^ (unsigned int)(pos * 40503u + 12345u);
     h ^= h >> 16;
-
     int a = (int)( h        & 0xFF) % 9;
     int b = (int)((h >>  8) & 0xFF) % 9;
     int c = (int)((h >> 16) & 0xFF) % 9;
-
-    /* Build permutation: slot[i] = (a*i*i + b*i + c) mod 9, value i+1 */
     bool used[9] = {false};
     int  cnt = 0;
-
     for (int i = 0; i < 9; i++) {
         int slot = (a * i * i + b * i + c) % 9;
-        /* Linear probe to resolve collisions */
         while (used[slot]) slot = (slot + 1) % 9;
         used[slot] = true;
         out[slot]  = i + 1;
         cnt++;
     }
-    /* cnt == 9 always; used[] guarantees full coverage */
     (void)cnt;
 }
 
-/* ===== ALGORITHM 4: Fibonacci hashing permutation =====
- *
- * Fibonacci hashing multiplies by the 32-bit Fibonacci/golden-ratio
- * constant (2654435769) and right-shifts to extract a bucket index.
- * Each of the 9 digits is mapped to a slot in [0..8]; linear probing
- * resolves collisions.  The result is a permutation of [1..9] where the
- * ordering reflects the golden-ratio structure of the hash function.
- *
- * This is distinct from both LCG and xorshift because no shuffle loop
- * is used at all -- the permutation emerges purely from the hash.
- */
+/* ===== ALGORITHM 4: Fibonacci hashing permutation ===== */
+
 void digit_order_fibonacci(int seed_mask, int pos, int out[9]) {
-    /* Per-position key: mix seed_mask and pos with a large prime */
     unsigned int base = (unsigned int)seed_mask * 2246822519u
                       ^ (unsigned int)(pos + 1)  * 3266489917u;
     base ^= base >> 15;
-
     bool used[9] = {false};
-
     for (int i = 0; i < 9; i++) {
-        /* Fibonacci hash of (base + i): multiply by phi-derived constant */
         unsigned int h = (base + (unsigned int)i * 2654435769u);
         h ^= h >> 16;
         int slot = (int)(h % 9u);
-        /* Linear probe */
         while (used[slot]) slot = (slot + 1) % 9;
         used[slot] = true;
         out[slot]  = i + 1;
@@ -179,9 +163,11 @@ void seed_digit_order(GeneratorType g, int seed_mask, int pos, int out[9]) {
     }
 }
 
-/* ===== FILL_BOARD_SEEDED ===== */
+/* ===== FILL_BOARD_SEEDED (instrumented) ===== */
 
 bool fill_board_seeded(int board[9][9], int seed_mask, int pos, GeneratorType g) {
+    gc.fill_calls++;
+
     if (pos == 81) return true;
     int r = pos / 9, c = pos % 9;
     if (board[r][c] != 0) return fill_board_seeded(board, seed_mask, pos + 1, g);
@@ -191,32 +177,48 @@ bool fill_board_seeded(int board[9][9], int seed_mask, int pos, GeneratorType g)
 
     for (int i = 0; i < 9; i++) {
         int v = order[i];
+        gc.fill_is_valid++;
         if (is_valid(board, r, c, v)) {
             board[r][c] = v;
+            gc.fill_placements++;
             if (fill_board_seeded(board, seed_mask, pos + 1, g)) return true;
             board[r][c] = 0;
+            gc.fill_backtracks++;
         }
     }
     return false;
 }
 
-/* ===== COUNT_SOLUTIONS ===== */
+/* ===== COUNT_SOLUTIONS (instrumented) ===== */
 
-int count_solutions(int board[9][9], int limit) {
+/*
+ * Internal recursive worker — uses a separate counter so the top-level
+ * wrapper can count invocations without double-counting.
+ */
+static int count_solutions_rec(int board[9][9], int limit) {
+    gc.cs_nodes++;
+
     int r = -1, c = -1;
     for (int i = 0; i < 9 && r == -1; i++)
         for (int j = 0; j < 9 && r == -1; j++)
             if (board[i][j] == 0) { r = i; c = j; }
     if (r == -1) return 1;
+
     int cnt = 0;
     for (int v = 1; v <= 9 && cnt < limit; v++) {
+        gc.cs_is_valid++;
         if (is_valid(board, r, c, v)) {
             board[r][c] = v;
-            cnt += count_solutions(board, limit - cnt);
+            cnt += count_solutions_rec(board, limit - cnt);
             board[r][c] = 0;
         }
     }
     return cnt;
+}
+
+int count_solutions(int board[9][9], int limit) {
+    gc.removal_count_calls++;
+    return count_solutions_rec(board, limit);
 }
 
 /* ===== SEED_REMOVAL_ORDER ===== */
@@ -234,9 +236,13 @@ void seed_removal_order(int seed_mask, int positions[81]) {
 /* ===== GENERATE_SUDOKU ===== */
 
 void generate_sudoku(void) {
+    /* Reset all counters for this run */
+    memset(&gc, 0, sizeof(gc));
+
     int board[9][9];
     memset(board, 0, sizeof(board));
 
+    /* ---- Phase 1: fill complete board ---- */
     fill_board_seeded(board, g_seed_mask, 0, g_game.generator);
 
     for (int i = 0; i < 9; i++)
@@ -246,12 +252,14 @@ void generate_sudoku(void) {
             g_game.solution[i][j].error = false;
         }
 
+    /* ---- Phase 2: remove cells (uniqueness check per candidate) ---- */
     int to_remove = (int)g_game.difficulty;
     int positions[81];
     seed_removal_order(g_seed_mask, positions);
 
     int removed = 0;
     for (int k = 0; k < 81 && removed < to_remove; k++) {
+        gc.removal_candidates++;
         int r = positions[k] / 9, c = positions[k] % 9;
         int backup = board[r][c];
         board[r][c] = 0;
@@ -263,6 +271,7 @@ void generate_sudoku(void) {
             board[r][c] = backup;
         }
     }
+    gc.removed = removed;
 
     for (int i = 0; i < 9; i++)
         for (int j = 0; j < 9; j++) {
@@ -273,8 +282,58 @@ void generate_sudoku(void) {
 
     g_game.solved  = false;
     g_game.elapsed = 0;
-    log_msg(LOG_INFO, "Sudoku generated: seed=%d difficulty=%d removed=%d generator=%d",
-            g_seed_mask, (int)g_game.difficulty, removed, (int)g_game.generator);
+
+    /* ---- Log summary ---- */
+    log_msg(LOG_INFO,
+        "=== Generation complete ===");
+    log_msg(LOG_INFO,
+        "  seed=%d  difficulty=%d  generator=%s",
+        g_seed_mask, (int)g_game.difficulty,
+        generator_name(g_game.generator));
+
+    log_msg(LOG_INFO,
+        "  [Phase 1: fill board]");
+    log_msg(LOG_INFO,
+        "    fill_calls      = %ld  (recursive invocations of fill_board_seeded)",
+        gc.fill_calls);
+    log_msg(LOG_INFO,
+        "    fill_is_valid   = %ld  (is_valid() calls during fill)",
+        gc.fill_is_valid);
+    log_msg(LOG_INFO,
+        "    fill_placements = %ld  (successful digit placements)",
+        gc.fill_placements);
+    log_msg(LOG_INFO,
+        "    fill_backtracks = %ld  (cells reset to 0 during backtrack)",
+        gc.fill_backtracks);
+
+    log_msg(LOG_INFO,
+        "  [Phase 2: cell removal / uniqueness checks]");
+    log_msg(LOG_INFO,
+        "    removal_candidates  = %ld  (cells tried for removal)",
+        gc.removal_candidates);
+    log_msg(LOG_INFO,
+        "    removal_count_calls = %ld  (count_solutions() top-level calls)",
+        gc.removal_count_calls);
+    log_msg(LOG_INFO,
+        "    cs_nodes            = %ld  (recursive nodes in all count_solutions runs)",
+        gc.cs_nodes);
+    log_msg(LOG_INFO,
+        "    cs_is_valid         = %ld  (is_valid() calls inside count_solutions)",
+        gc.cs_is_valid);
+    log_msg(LOG_INFO,
+        "    removed             = %ld  (cells successfully removed)",
+        gc.removed);
+
+    long total_is_valid = gc.fill_is_valid + gc.cs_is_valid;
+    long total_ops      = gc.fill_calls + gc.cs_nodes;
+    log_msg(LOG_INFO,
+        "  [Totals]");
+    log_msg(LOG_INFO,
+        "    total is_valid calls = %ld",
+        total_is_valid);
+    log_msg(LOG_INFO,
+        "    total recursive nodes (fill + removal) = %ld",
+        total_ops);
 }
 
 /* ===== VALIDATE_BOARD ===== */
